@@ -16,9 +16,9 @@ app.use(cors())
 const server = http.createServer(app);
 
 //openai
-const openai = new OpenAi({
-  apiKey: process.env.OPEN_AI_KEY,
-})
+// const openai = new OpenAi({
+//   apiKey: process.env.OPEN_AI_KEY,
+// })
 
 
 // // Set axios default headers
@@ -30,7 +30,7 @@ cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET,
-});
+});                                 
 
 // Socket.IO configuration with better error handling
 const io = new Server(server, {
@@ -104,7 +104,7 @@ io.on("connection", (socket) => {
       // Start processing
       console.log("🟢Came on processing")
       const processing = await axios.post(
-        `${process.env.NEXT_API_HOST}recording/${data.userId}/processing`,
+        `${process.env.NEXT_API_HOST}/api/recording/${data.userId}/processing`,
         { filename: data.filename }
       );
 
@@ -149,35 +149,35 @@ io.on("connection", (socket) => {
                       console.log("🟢Came for transcription")
                       
 
-                      const completion = await openai.chat.completions.create({
-                        model: 'gpt-3.5-turbo',
-                        response_format: { type: 'json_object' },
-                        messages: [
-                          {
-                            role: 'system',
-                            content: `You are going to generate a title and a nice description using the speech to text transcription provided: transcription(${transcription})  
-                            and then return it in json format as {"title":<the title you gave>,"summary":<the summary you created>}`,
-                          },
-                        ],
-                      });
+                      // const completion = await openai.chat.completions.create({
+                      //   model: 'gpt-3.5-turbo',
+                      //   response_format: { type: 'json_object' },
+                      //   messages: [
+                      //     {
+                      //       role: 'system',
+                      //       content: `You are going to generate a title and a nice description using the speech to text transcription provided: transcription(${transcription})  
+                      //       and then return it in json format as {"title":<the title you gave>,"summary":<the summary you created>}`,
+                      //     },
+                      //   ],
+                      // });
                     
-                      console.log("🟢Completion set hai", JSON.stringify(completion, null, 2));
+                      // console.log("🟢Completion set hai", JSON.stringify(completion, null, 2));
 
                       // Testing
-                      if (
-                        !completion ||
-                        !completion.choices ||
-                        completion.choices.length === 0 ||
-                        !completion.choices[0].message
-                      ) {
-                        console.error("🔴 Error: OpenAI API did not return a valid response.", completion);
-                        throw new Error("OpenAI API response is undefined or invalid.");
-                      }
+                      // if (
+                      //   !completion ||
+                      //   !completion.choices ||
+                      //   completion.choices.length === 0 ||
+                      //   !completion.choices[0].message
+                      // ) {
+                      //   console.error("🔴 Error: OpenAI API did not return a valid response.", completion);
+                      //   throw new Error("OpenAI API response is undefined or invalid.");
+                      // }
 
-                      console.log("Completion is finally done");
+                      // console.log("Completion is finally done");
 
                       const titleAndSummaryGenerated = await axios.post(
-                        `${process.env.NEXT_API_HOST}recording/${data.userId}/transcribe`,
+                        `${process.env.NEXT_API_HOST}/api/recording/${data.userId}/transcribe`,
                         {
                           filename: data.filename,
                           content: completion.choices[0].message.content,
@@ -195,8 +195,10 @@ io.on("connection", (socket) => {
 
             // Complete processing
             const stopProcessing = await axios.post(
-              `${process.env.NEXT_API_HOST}recording/${data.userId}/complete`,
-              { filename: data.filename }
+              `${process.env.NEXT_API_HOST}/api/recording/${data.userId}/complete`,
+              { filename: data.filename,
+                videoUrl: result.secure_url,  
+               }
             );
 
             if (stopProcessing.data.status !== 200) {
