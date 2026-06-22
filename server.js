@@ -1,111 +1,116 @@
 const express = require("express");
 const cors = require("cors");
-const { Server } = require('socket.io');
+const { Server } = require("socket.io");
 const fs = require("fs");
 const http = require("http");
 const dotenv = require("dotenv");
-const { Readable } = require("stream");
 const axios = require("axios");
 const cloudinary = require("cloudinary").v2;
 const path = require("path");
-const OpenAi=require("openai")
+const { GoogleGenAI } = require("@google/genai");
+
 dotenv.config();
+
+// Crash early if the secret is missing so you don't find out the hard way
+if (!process.env.INTERNAL_SERVER_SECRET) {
+  console.error("🔴 FATAL ERROR: INTERNAL_SERVER_SECRET is missing from .env");
+  process.exit(1);
+}
+
 const app = express();
-app.use(cors())
+app.use(cors());
 
 const server = http.createServer(app);
-
-//openai
-// const openai = new OpenAi({
-//   apiKey: process.env.OPEN_AI_KEY,
-// })
-
-
-// // Set axios default headers
-// axios.defaults.headers.common["origin"] = 'https://opal-express-gc8f.onrender.com';
-// axios.defaults.headers.common["Content-Type"] = "application/json";
 
 // Cloudinary configuration
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET,
-});                                 
+});
 
-// Socket.IO configuration with better error handling
+// Initialize the Gemini Client
+const ai = new GoogleGenAI({
+  apiKey: process.env.GEMINI_API_KEY,
+});
+
 const io = new Server(server, {
   cors: {
-      origin: '*',
-      methods: ["GET", "POST"],
+    origin: "*",
+    methods: ["GET", "POST"],
   },
-})
-// Ensure temp_upload directory exists
-const uploadDir = path.join(__dirname, 'temp_upload');
+});
+
+const uploadDir = path.join(__dirname, "temp_upload");
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
 }
 
-
-// Store chunks per socket connection
-const socketChunks = new Map();
+// 🟢 FIX #2 APPLIED: Stream map is now global to handle user disconnects/reconnects
+const activeUploadStreams = new Map();
 
 io.on("connection", (socket) => {
   console.log("🟢 Socket connected:", socket.id);
-  socketChunks.set(socket.id, []);
-
   socket.emit("connected");
 
-  socket.on("video-chunks", async (data) => {
+  socket.on("video-chunks", (data) => {
     try {
-      console.log("🟢 Receiving video chunk for:", data.filename);
-      
-      const chunks = socketChunks.get(socket.id);
-      chunks.push(data.chunks);
-      
       const filePath = path.join(uploadDir, data.filename);
-      const writeStream = fs.createWriteStream(filePath);
-      
-      const videoBlob = new Blob(chunks, {
-        type: "video/webm; codecs=vp9",
-      });
-      
-      const buffer = Buffer.from(await videoBlob.arrayBuffer());
-      const readStream = Readable.from(buffer);
-      
-      readStream.pipe(writeStream);
-      
-      writeStream.on("finish", () => {
-        console.log("🟢 Chunk saved for:", data.filename);
-      });
+      const chunkBuffer = Buffer.from(data.chunks);
 
-      writeStream.on("error", (error) => {
-        console.error("🔴 Error saving chunk:", error);
-        socket.emit("upload-error", { message: "Failed to save video chunk" });
+      let writeStream = activeUploadStreams.get(data.filename);
+
+      if (!writeStream) {
+        writeStream = fs.createWriteStream(filePath, { flags: "a" });
+        activeUploadStreams.set(data.filename, writeStream);
+
+        writeStream.on("error", (err) => {
+          console.error("🔴 Stream error:", err);
+          activeUploadStreams.delete(data.filename);
+        });
+      }
+
+      // This guarantees chronological order!
+      writeStream.write(chunkBuffer, (err) => {
+        if (err) {
+          console.error("🔴 Error writing chunk:", err);
+          socket.emit("upload-error", { message: "Failed to save chunk" });
+        }
       });
     } catch (error) {
       console.error("🔴 Error processing video chunk:", error);
-      socket.emit("upload-error", { message: "Failed to process video chunk" });
+      socket.emit("upload-error", { message: "Failed to process chunk" });
     }
   });
 
   socket.on("process-video", async (data) => {
+    const filePath = path.join(uploadDir, data.filename);
+
     try {
       console.log("🟢 Processing video:", data.filename);
-      socketChunks.set(socket.id, []); // Clear chunks
 
-      const filePath = path.join(uploadDir, data.filename);
-      
-      // Verify file exists
-      console.log("🟢Came on File Check")
+      // 🟢 FIX #1 APPLIED: Securely close the write stream before reading
+      const writeStream = activeUploadStreams.get(data.filename);
+      if (writeStream) {
+        await new Promise((resolve) => {
+          writeStream.end(resolve);
+        });
+        activeUploadStreams.delete(data.filename); // Clean up memory map
+      }
+
       if (!fs.existsSync(filePath)) {
         throw new Error("Video file not found");
       }
-      
-      // Start processing
-      console.log("🟢Came on processing")
+
+      // Send the secret token to Next.js
       const processing = await axios.post(
         `${process.env.NEXT_API_HOST}/api/recording/${data.userId}/processing`,
-        { filename: data.filename }
+        { filename: data.filename },
+        {
+          headers: {
+            Authorization: `Bearer ${process.env.INTERNAL_SERVER_SECRET}`,
+          },
+        },
       );
 
       if (processing.data.status !== 200) {
@@ -113,135 +118,176 @@ io.on("connection", (socket) => {
       }
 
       // Upload to Cloudinary
-      console.log("🟢 Cloudinary Config:", {
-        cloud_name: cloudinary.config().cloud_name,
-        api_key: cloudinary.config().api_key,
-      });
-      console.log("🟢Came for the upload")
-      
-      const cloudinaryUpload = cloudinary.uploader.upload_stream(
-        {
-          resource_type: "video",
-          folder: "vync",
-          public_id: data.filename,
-          },
-        async (error, result) => {
-          try {
-            if (error) {
-              throw error;
-            }
+      const uploadToCloudinary = () => {
+        return new Promise((resolve, reject) => {
+          const uploadStream = cloudinary.uploader.upload_stream(
+            {
+              resource_type: "video",
+              folder: "vync",
+              public_id: data.filename,
+              chunk_size: 6000000, // 🟢 ADDED: Cloudinary chunking for large files!
+            },
+            (error, result) => {
+              if (error) reject(error);
+              else resolve(result);
+            },
+          );
+          fs.createReadStream(filePath).pipe(uploadStream);
+        });
+      };
 
-            console.log("🟢 Video uploaded to Cloudinary:", result.secure_url);
+      const uploadResult = await uploadToCloudinary();
+      console.log("🟢 Video uploaded to Cloudinary:", uploadResult.secure_url);
 
-            //Transcript
-            if(processing.data.plan ==='PRO'){
-              fs.stat('temp_upload/' + data.filename, async(err,stat)=>{
-                if(!err){
-                  if(stat.size<25000000){
-                    const transcription =await openai.audio.transcriptions.create({
+      // Handle AI functionality for PRO users
+      // Handle AI functionality for PRO users
+      if (processing.data.plan === "PRO") {
+        try {
+          console.log("🟢 Started Gemini AI Analysis...");
 
-                      file:fs.createReadStream(`temp_upload/${data.filename}`),
-                      model:'whisper-1',
-                      response_format:'text',
+          const uploadedFile = await ai.files.upload({
+            file: filePath,
+            config: { mimeType: "video/webm" },
+          });
 
-                    })
-                    if(transcription){
-                      console.log("🟢Came for transcription")
-                      
+          let fileStatus = await ai.files.get({
+            name: uploadedFile.name,
+          });
 
-                      // const completion = await openai.chat.completions.create({
-                      //   model: 'gpt-3.5-turbo',
-                      //   response_format: { type: 'json_object' },
-                      //   messages: [
-                      //     {
-                      //       role: 'system',
-                      //       content: `You are going to generate a title and a nice description using the speech to text transcription provided: transcription(${transcription})  
-                      //       and then return it in json format as {"title":<the title you gave>,"summary":<the summary you created>}`,
-                      //     },
-                      //   ],
-                      // });
-                    
-                      // console.log("🟢Completion set hai", JSON.stringify(completion, null, 2));
+          let retries = 0;
 
-                      // Testing
-                      // if (
-                      //   !completion ||
-                      //   !completion.choices ||
-                      //   completion.choices.length === 0 ||
-                      //   !completion.choices[0].message
-                      // ) {
-                      //   console.error("🔴 Error: OpenAI API did not return a valid response.", completion);
-                      //   throw new Error("OpenAI API response is undefined or invalid.");
-                      // }
+          while (fileStatus.state === "PROCESSING" && retries < 60) {
+            retries++;
 
-                      // console.log("Completion is finally done");
+            console.log(`⏳ Gemini Processing... Attempt ${retries}`);
 
-                      const titleAndSummaryGenerated = await axios.post(
-                        `${process.env.NEXT_API_HOST}/api/recording/${data.userId}/transcribe`,
-                        {
-                          filename: data.filename,
-                          content: completion.choices[0].message.content,
-                          transcript: transcription,
-                        }
-                      );
-                      if (titleAndSummaryGenerated.data.status!==200){
-                        console.log("🔴Error : Something Went Wrong with transcription title and description")
-                      }
-                    }
-                  }
-                }
-              })
-            }
+            await new Promise((resolve) => setTimeout(resolve, 2000));
 
-            // Complete processing
-            const stopProcessing = await axios.post(
-              `${process.env.NEXT_API_HOST}/api/recording/${data.userId}/complete`,
-              { filename: data.filename,
-                videoUrl: result.secure_url,  
-               }
-            );
-
-            if (stopProcessing.data.status !== 200) {
-              throw new Error("Failed to complete processing");
-            }
-
-            // Clean up
-            fs.unlink(filePath, (err) => {
-              if (err) {
-                console.error("🔴 Error deleting file:", err);
-              } else {
-                console.log("🟢 Deleted file:", data.filename);
-              }
+            fileStatus = await ai.files.get({
+              name: uploadedFile.name,
             });
-
-          } catch (error) {
-            console.error("🔴 Error in Cloudinary upload callback:", error);
           }
+
+          if (fileStatus.state === "FAILED") {
+            throw new Error("Gemini failed to process uploaded file");
+          }
+
+          if (retries >= 60) {
+            throw new Error("Gemini timeout");
+          }
+
+          const prompt = `
+      Analyze this video.
+
+      1. Transcribe spoken audio completely.
+      2. Generate a short title.
+      3. Generate a concise summary.
+
+      Return ONLY valid JSON:
+
+      {
+        "transcript":"",
+        "title":"",
+        "summary":""
+      }
+    `;
+
+          const response = await ai.models.generateContent({
+            model: "gemini-2.5-flash",
+            contents: [
+              {
+                fileData: {
+                  fileUri: uploadedFile.uri,
+                  mimeType: uploadedFile.mimeType,
+                },
+              },
+              {
+                text: prompt,
+              },
+            ],
+            config: {
+              responseMimeType: "application/json",
+            },
+          });
+
+          console.log("🟢 Gemini Raw Response:", response.text);
+
+          const aiData = JSON.parse(response.text);
+
+          await axios.post(
+            `${process.env.NEXT_API_HOST}/api/recording/${data.userId}/transcribe`,
+            {
+              filename: data.filename,
+              content: JSON.stringify({
+                title: aiData.title,
+                summary: aiData.summary,
+              }),
+              transcript: aiData.transcript,
+            },
+            {
+              headers: {
+                Authorization: `Bearer ${process.env.INTERNAL_SERVER_SECRET}`,
+              },
+            },
+          );
+
+          await ai.files.delete({
+            name: uploadedFile.name,
+          });
+
+          console.log("🟢 AI Processing Complete");
+        } catch (geminiError) {
+          console.error(
+            "🔴 Gemini Failed:",
+            geminiError.message || geminiError,
+          );
+
+          console.log("🟢 Continuing video upload without AI...");
         }
+      }
+
+      // Tell Next.js the upload/processing is complete
+      const stopProcessing = await axios.post(
+        `${process.env.NEXT_API_HOST}/api/recording/${data.userId}/complete`,
+        {
+          filename: data.filename,
+          videoUrl: uploadResult.secure_url,
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${process.env.INTERNAL_SERVER_SECRET}`,
+          },
+        },
       );
 
-      fs.createReadStream(filePath).pipe(cloudinaryUpload);
-
+      if (stopProcessing.data.status !== 200) {
+        throw new Error("Failed to complete processing");
+      }
     } catch (error) {
-      console.error("🔴 Error processing video:", error);
+      console.error(
+        "🔴 Error processing video globally:",
+        error.message || error,
+      );
+    } finally {
+      if (fs.existsSync(filePath)) {
+        fs.unlink(filePath, (err) => {
+          if (err) console.error("🔴 Error deleting file:", err);
+          else console.log("🟢 Cleaned up local file:", data.filename);
+        });
+      }
     }
   });
 
-
   socket.on("disconnect", () => {
     console.log("🔴 Socket disconnected:", socket.id);
-    socketChunks.delete(socket.id); // Clean up chunks
   });
 });
 
-// Error handling for unhandled rejections
-process.on('unhandledRejection', (error) => {
-  console.error('🔴 Unhandled Rejection:', error);
+process.on("unhandledRejection", (error) => {
+  console.error("🔴 Unhandled Rejection:", error);
 });
 
-// Start server
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, async () => {
+server.listen(PORT, () => {
   console.log(`🟢 Server listening on port ${PORT}`);
 });
-
