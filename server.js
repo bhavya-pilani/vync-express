@@ -18,7 +18,15 @@ if (!process.env.INTERNAL_SERVER_SECRET) {
 }
 
 const app = express();
-app.use(cors());
+app.use(
+  cors({
+    origin: [
+      "https://vync-157i.vercel.app",
+      "http://localhost:3000"
+    ],
+    credentials: true,
+  })
+);
 
 const server = http.createServer(app);
 
